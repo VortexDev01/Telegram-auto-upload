@@ -1,0 +1,16 @@
+# GUI
+customtkinter==5.2.2
+
+# Telegram MTProto API
+pyrogram==2.0.106
+# tgcrypto is optional (speeds up crypto but requires C compiler; pyrogram falls back to pyaes)
+
+# Natural file sorting (important for correct episode order)
+natsort==8.4.0
+
+# Optional utilities (recommended)
+python-dotenv==1.0.1
+loguru==0.7.2
+
+# Build tool (only needed for packaging to EXE)
+pyinstaller==6.18.0

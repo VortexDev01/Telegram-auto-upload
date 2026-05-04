@@ -1,0 +1,15 @@
+# Secrets & sessions
+config.json
+*.session
+*.session-journal
+upload_state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+build/
+*.spec
+*.egg-info/

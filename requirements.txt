@@ -3,7 +3,9 @@ customtkinter==5.2.2
 
 # Telegram MTProto API
 pyrogram==2.0.106
-# tgcrypto is optional (speeds up crypto but requires C compiler; pyrogram falls back to pyaes)
+# Fast encryption for uploads (~100x faster than the pure-Python fallback).
+# Prebuilt wheels for Python 3.8-3.13; provides the `tgcrypto` module.
+TgCrypto-pyrofork==1.2.8
 
 # Natural file sorting (important for correct episode order)
 natsort==8.4.0

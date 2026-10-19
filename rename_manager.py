@@ -22,7 +22,7 @@ def generate_caption(template: str, base_name: str, index: int) -> str:
     """
     try:
         return template.format(name=f"{base_name} {index}", index=index)
-    except KeyError:
+    except (KeyError, IndexError, ValueError):
         return f"{base_name} {index}"
 
 

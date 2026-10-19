@@ -3,23 +3,29 @@ Settings Window
 Modal dialog for entering API ID, API Hash, Target Chat ID, Telegram Bot Token, and preferences.
 """
 
+import asyncio
+import threading
+
 import customtkinter as ctk
 from loguru import logger
 
 import config_manager
+import database
+from telegram_service import TelegramService
 
 
 class SettingsWindow(ctk.CTkToplevel):
     """A modal settings dialog."""
 
-    def __init__(self, parent, on_save_callback=None):
+    def __init__(self, parent, on_save_callback=None, is_busy=None):
         super().__init__(parent)
         self.title("⚙  Settings")
-        self.geometry("540x730")
-        self.resizable(False, False)
+        self.geometry("560x760")
+        self.minsize(540, 500)
         self.grab_set()  # modal
         self.transient(parent)
         self._on_save = on_save_callback
+        self._is_busy = is_busy or (lambda: False)
         self._config = config_manager.load_config()
         self._show_token = False  # toggle for showing/hiding bot token
 
@@ -46,9 +52,16 @@ class SettingsWindow(ctk.CTkToplevel):
         )
         subtitle.pack(pady=(0, 20))
 
-        # ---- Scrollable form area ----
-        form = ctk.CTkFrame(self, fg_color="#16213e", corner_radius=14)
-        form.pack(padx=28, pady=0, fill="x")
+        # Buttons and status stay pinned at the bottom; the form scrolls.
+        bottom = ctk.CTkFrame(self, fg_color="transparent")
+        bottom.pack(side="bottom", fill="x")
+
+        body = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=8)
+
+        # ---- Form area ----
+        form = ctk.CTkFrame(body, fg_color="#16213e", corner_radius=14)
+        form.pack(padx=20, pady=0, fill="x")
 
         # --- API ID ---
         self._make_label(form, "API ID")
@@ -95,6 +108,29 @@ class SettingsWindow(ctk.CTkToplevel):
         )
         self.caption_entry.pack(padx=20, fill="x")
 
+        # --- Parallel uploads ---
+        self._make_label(form, "Parallel Uploads (files at the same time)")
+        self.parallel_var = ctk.StringVar(value="2")
+        self.parallel_menu = ctk.CTkSegmentedButton(
+            form,
+            values=[str(n) for n in range(1, config_manager.MAX_PARALLEL_UPLOADS + 1)],
+            variable=self.parallel_var,
+            selected_color="#e94560", selected_hover_color="#c73052",
+            unselected_color="#0f3460",
+        )
+        self.parallel_menu.pack(padx=20, anchor="w")
+
+        # --- Skip already uploaded toggle ---
+        self.skip_uploaded_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(
+            form, text="Skip files already uploaded to this chat",
+            variable=self.skip_uploaded_var,
+            onvalue=True, offvalue=False,
+            font=ctk.CTkFont(size=13),
+            text_color="#ccd6f6",
+            progress_color="#e94560",
+        ).pack(padx=20, pady=(14, 0), anchor="w")
+
         # --- Send As Video toggle ---
         self.send_as_video_var = ctk.BooleanVar(value=True)
         self.video_switch = ctk.CTkSwitch(
@@ -110,8 +146,8 @@ class SettingsWindow(ctk.CTkToplevel):
         # ==============================================================
         #  TELEGRAM BOT API KEY SECTION
         # ==============================================================
-        bot_frame = ctk.CTkFrame(self, fg_color="#16213e", corner_radius=14)
-        bot_frame.pack(padx=28, pady=(12, 0), fill="x")
+        bot_frame = ctk.CTkFrame(body, fg_color="#16213e", corner_radius=14)
+        bot_frame.pack(padx=20, pady=(12, 0), fill="x")
 
         bot_header_row = ctk.CTkFrame(bot_frame, fg_color="transparent")
         bot_header_row.pack(fill="x", padx=20, pady=(14, 4))
@@ -159,9 +195,44 @@ class SettingsWindow(ctk.CTkToplevel):
         )
         self.bot_status_label.pack(pady=(0, 12))
 
+        # ==============================================================
+        #  CHECKS & MAINTENANCE
+        # ==============================================================
+        tools_frame = ctk.CTkFrame(body, fg_color="#16213e", corner_radius=14)
+        tools_frame.pack(padx=20, pady=(12, 4), fill="x")
+
+        tools_row = ctk.CTkFrame(tools_frame, fg_color="transparent")
+        tools_row.pack(padx=20, pady=(14, 4))
+
+        self.test_btn = ctk.CTkButton(
+            tools_row, text="🔌  Test Connection", width=170, height=36,
+            corner_radius=10,
+            fg_color="#0f3460", hover_color="#16213e",
+            border_width=1, border_color="#4ecca3",
+            font=ctk.CTkFont(size=13),
+            command=self._test_connection,
+        )
+        self.test_btn.pack(side="left", padx=6)
+
+        ctk.CTkButton(
+            tools_row, text="🧹  Clear Upload History", width=190, height=36,
+            corner_radius=10,
+            fg_color="#0f3460", hover_color="#16213e",
+            border_width=1, border_color="#e94560",
+            font=ctk.CTkFont(size=13),
+            command=self._clear_history,
+        ).pack(side="left", padx=6)
+
+        self.tools_status_label = ctk.CTkLabel(
+            tools_frame, text=f"Data folder: {database.DATA_DIR}",
+            font=ctk.CTkFont(size=11), text_color="#8892b0",
+            wraplength=460, justify="left",
+        )
+        self.tools_status_label.pack(padx=20, pady=(4, 12))
+
         # --- Main Buttons ---
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(pady=16)
+        btn_frame = ctk.CTkFrame(bottom, fg_color="transparent")
+        btn_frame.pack(pady=(12, 6))
 
         save_btn = ctk.CTkButton(
             btn_frame, text="💾  Save All", width=140, height=42,
@@ -184,8 +255,8 @@ class SettingsWindow(ctk.CTkToplevel):
 
         # Global status label
         self.status_label = ctk.CTkLabel(
-            self, text="", font=ctk.CTkFont(size=12),
-            text_color="#e94560",
+            bottom, text="", font=ctk.CTkFont(size=12),
+            text_color="#e94560", wraplength=500, justify="left",
         )
         self.status_label.pack(pady=(0, 10))
 
@@ -211,6 +282,8 @@ class SettingsWindow(ctk.CTkToplevel):
         self.delay_entry.insert(0, str(c.get("upload_delay", 2)))
         self.caption_entry.insert(0, str(c.get("caption_template", "")))
         self.send_as_video_var.set(c.get("send_as_video", True))
+        self.parallel_var.set(str(c.get("parallel_uploads", 2)))
+        self.skip_uploaded_var.set(bool(c.get("skip_uploaded", True)))
         # Bot token
         bot_token = str(c.get("telegram_bot_token", ""))
         if bot_token:
@@ -230,63 +303,62 @@ class SettingsWindow(ctk.CTkToplevel):
             self.bot_token_entry.configure(show="•")
             self.toggle_token_btn.configure(text="👁  Show")
 
+    def _collect_form(self) -> dict:
+        """Read every field into a config dict (values are not validated yet)."""
+        delay_text = self.delay_entry.get().strip() or "2"
+        return {
+            "api_id": self.api_id_entry.get().strip(),
+            "api_hash": self.api_hash_entry.get().strip(),
+            "chat_id": self.chat_id_entry.get().strip(),
+            "telegram_bot_token": self.bot_token_entry.get().strip(),
+            "upload_delay": int(delay_text) if delay_text.isdigit() else delay_text,
+            "caption_template": self.caption_entry.get().strip(),
+            "send_as_video": self.send_as_video_var.get(),
+            "parallel_uploads": int(self.parallel_var.get() or 2),
+            "skip_uploaded": self.skip_uploaded_var.get(),
+        }
+
     def _store_bot_token(self):
-        """Store only the Telegram Bot API key immediately."""
-        token = self.bot_token_entry.get().strip()
-        api_id = self.api_id_entry.get().strip()
-        api_hash = self.api_hash_entry.get().strip()
-        chat_id = self.chat_id_entry.get().strip()
-        if not token or not api_id or not api_hash or not chat_id:
+        """Store the Telegram Bot API key (and credentials) immediately."""
+        new_config = self._collect_form()
+        if not new_config["telegram_bot_token"]:
             self.bot_status_label.configure(
                 text="⚠ Please enter a bot token first.",
                 text_color="#e94560",
             )
             return
 
-        # Basic format validation: Telegram bot tokens look like 123456:ABC-DEF...
-        if ":" not in token or len(token) < 20:
-            self.bot_status_label.configure(
-                text="⚠ Token format looks invalid (expected 123456:ABC-DEF...)",
-                text_color="#e94560",
-            )
+        errors = config_manager.validate_config(new_config)
+        if errors:
+            self.bot_status_label.configure(text="⚠ " + errors[0], text_color="#e94560")
             return
 
-        # Save token to config
-        current_config = config_manager.load_config()
-        current_config["telegram_bot_token"] = token
-        current_config["api_id"] = api_id
-        current_config["api_hash"] = api_hash
-        current_config["chat_id"] = chat_id
-        if config_manager.save_config(current_config):
-            self._config = current_config
+        if config_manager.save_config(new_config):
+            self._config = config_manager.load_config()
             self.bot_status_label.configure(
                 text="✅ Bot API Key stored successfully!",
                 text_color="#4ecca3",
             )
             logger.info("Telegram Bot API Key stored.")
+            if self._on_save:
+                self._on_save(self._config)
         else:
             self.bot_status_label.configure(
-                text="❌ Failed to save. Check file permissions.",
+                text="❌ Failed to save settings.",
                 text_color="#e94560",
             )
 
     def _on_save_click(self):
-        new_config = {
-            "api_id": self.api_id_entry.get().strip(),
-            "api_hash": self.api_hash_entry.get().strip(),
-            "chat_id": self.chat_id_entry.get().strip(),
-            "telegram_bot_token": self.bot_token_entry.get().strip(),
-            "upload_delay": int(self.delay_entry.get().strip() or 2),
-            "caption_template": self.caption_entry.get().strip(),
-            "send_as_video": self.send_as_video_var.get(),
-        }
+        new_config = self._collect_form()
 
         errors = config_manager.validate_config(new_config)
         if errors:
-            self.status_label.configure(text="\n".join(errors))
+            self.status_label.configure(text="\n".join(errors), text_color="#e94560")
             return
 
-        config_manager.save_config(new_config)
+        if not config_manager.save_config(new_config):
+            self.status_label.configure(text="❌ Failed to save settings.", text_color="#e94560")
+            return
         self.status_label.configure(text="✅ All settings saved!", text_color="#4ecca3")
         logger.info("Settings saved via dialog.")
 
@@ -294,3 +366,79 @@ class SettingsWindow(ctk.CTkToplevel):
             self._on_save(new_config)
 
         self.after(800, self.destroy)
+
+    # ------------------------------------------------------------------
+    # Checks & maintenance
+    # ------------------------------------------------------------------
+
+    def _set_tools_status(self, text: str, color: str = "#8892b0"):
+        try:
+            self.tools_status_label.configure(text=text, text_color=color)
+        except Exception:
+            pass  # window closed
+
+    def _test_connection(self):
+        """Log in with the entered credentials and check the target chat."""
+        if self._is_busy():
+            self._set_tools_status("⚠ Can't test while an upload is running.", "#e94560")
+            return
+
+        config = self._collect_form()
+        errors = config_manager.validate_config(config)
+        if errors:
+            self._set_tools_status("⚠ " + "\n".join(errors), "#e94560")
+            return
+
+        self.test_btn.configure(state="disabled")
+        self._set_tools_status("⏳ Connecting to Telegram…")
+
+        result: list[tuple[str, str]] = []
+
+        def report(text: str, color: str):
+            result.append((text, color))
+
+        # Only the Tk thread may touch widgets, so poll for the worker's result.
+        def poll():
+            if not result:
+                self.after(200, poll)
+                return
+            self._set_tools_status(*result[0])
+            self.test_btn.configure(state="normal")
+
+        self.after(200, poll)
+
+        async def run_check():
+            svc = TelegramService(int(config["api_id"]), config["api_hash"],
+                                  bot_token=config["telegram_bot_token"])
+            try:
+                await svc.start()
+                summary = await svc.check_chat(config_manager.normalize_chat_id(config["chat_id"]))
+                return summary
+            finally:
+                await svc.stop()
+
+        def worker():
+            try:
+                summary = asyncio.run(run_check())
+                color = "#f0a500" if "⚠" in summary else "#4ecca3"
+                logger.info(f"Connection test OK: {summary}")
+                report(f"✅ Connected. Target chat: {summary}", color)
+            except Exception as e:
+                logger.error(f"Connection test failed: {e}")
+                report(f"❌ {e}", "#e94560")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _clear_history(self):
+        chat_id = self.chat_id_entry.get().strip()
+        if not chat_id:
+            self._set_tools_status("⚠ Enter a Target Chat ID first.", "#e94560")
+            return
+        removed = database.clear_history(config_manager.chat_key(chat_id))
+        logger.info(f"Cleared {removed} upload history record(s) for {chat_id}.")
+        self._set_tools_status(
+            f"🧹 Cleared {removed} record(s). Files sent to {chat_id} will upload again.",
+            "#4ecca3",
+        )
+        if self._on_save:
+            self._on_save(self._config)

@@ -13,3 +13,6 @@ dist/
 build/
 *.spec
 *.egg-info/
+*.db
+*.db-wal
+*.db-shm

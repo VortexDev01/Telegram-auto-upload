@@ -17,10 +17,13 @@ This project is built with:
 - Upload as Telegram video or as document
 - Custom caption template with placeholders
 - Optional bot token support
-- Sequential upload flow with retry and `FloodWait` handling
-- Cancel safely after the current file finishes
-- Resume interrupted uploads with `upload_state.json`
-- Persistent settings stored in `config.json`
+- Fast uploads: TgCrypto encryption plus several files uploading in parallel (messages are still posted in order)
+- Live speed (MB/s) and ETA, with per-file status in the list
+- Retry and `FloodWait` handling; stops early on permission errors instead of failing every file
+- Cancel at any time
+- Pre-upload checks: missing, empty and too-large files, and files already uploaded to the same chat
+- Test Connection button to verify credentials and chat access before uploading
+- Settings, upload history and the last folder / rename text are saved in a local SQLite database
 
 ## Supported video formats
 
@@ -70,24 +73,16 @@ Open the app, then go to `Settings` and fill in:
 - `API ID`: your Telegram API ID
 - `API Hash`: your Telegram API hash
 - `Target Chat ID`: a numeric chat ID like `-1001234567890` or a public username like `@mychannel`
-- `Delay Between Uploads`: pause between files in seconds
+- `Delay Between Uploads`: pause between posted messages in seconds (uploads keep running during the pause)
 - `Caption Template`: supports `{name}` and `{index}`
 - `Send as Video`: toggle between video upload and document upload
+- `Parallel Uploads`: how many files upload at the same time (1-4, default 2)
+- `Skip files already uploaded`: skip files that were already sent to the same chat
 - `Telegram Bot API Key`: optional, only needed if you want to upload as a bot
 
-Example `config.json`:
-
-```json
-{
-  "api_id": "12345678",
-  "api_hash": "your_api_hash_here",
-  "chat_id": "@your_channel",
-  "telegram_bot_token": "",
-  "upload_delay": 2,
-  "caption_template": "{name}\nEpisode {index}",
-  "send_as_video": true
-}
-```
+Use `Test Connection` to log in and check that the target chat can be reached
+(for channels it also checks that you are an admin who can post).
+`Clear Upload History` forgets which files were sent to the current chat, so they upload again.
 
 ## How it works
 
@@ -97,7 +92,7 @@ Example `config.json`:
 4. Review the preview list.
 5. Click `Start Upload`.
 
-The app will upload files one by one using renamed display names like:
+The app uploads the files using renamed display names like:
 
 - `My Series 1.mp4`
 - `My Series 2.mp4`
@@ -142,27 +137,28 @@ Important bot limitations:
 
 ## Resume behavior
 
-The app writes progress to `upload_state.json` while uploading.
+Every successfully sent file is recorded in the upload history (by path, size and
+modified time, per target chat). If an upload is cancelled or the app closes, just
+press `Start Upload` again: files already sent are shown as `✔ Uploaded` and skipped.
+Episode numbers stay the same because they come from the file's position in the folder.
 
-- If the app stops unexpectedly, it can resume from the previous position
-- Resume only works when the selected file list matches the earlier upload set
-- The resume file is cleared automatically after a full successful run
+## Where data is stored
 
-## Generated local files
+Everything lives in `%APPDATA%\AutoUpload` (open it from `Menu → Open Data Folder`):
 
-These files are created during normal use:
+- `autoupload.db`: SQLite database with settings and upload history
+- `*.session`: Pyrogram login sessions
+- `logs\autoupload.log`: log file (rotates at 5 MB)
 
-- `config.json`: saved application settings
-- `*.session` and `*.session-journal`: Pyrogram session files
-- `upload_state.json`: upload resume state
-
-These are already listed in `.gitignore` and should not be committed.
+Because this folder is outside the app, settings survive restarts and rebuilding the EXE.
+On first start, an existing `config.json` and user login session next to the app are imported automatically.
 
 ## Project structure
 
 ```text
 .
 |-- main.py
+|-- database.py
 |-- config_manager.py
 |-- file_manager.py
 |-- rename_manager.py
@@ -183,7 +179,12 @@ These are already listed in `.gitignore` and should not be committed.
 
 ### Upload stops because of Telegram rate limits
 
-The uploader already handles `FloodWait` by sleeping and retrying. If uploads still feel unstable, increase `upload_delay`.
+The uploader already handles `FloodWait` by sleeping and retrying. If uploads still feel unstable, lower `Parallel Uploads` or increase the delay.
+
+### Uploads are slow
+
+- Make sure `TgCrypto-pyrofork` is installed (`pip install -r requirements.txt`). Without it, encryption runs in pure Python at under 1 MB/s and the log shows a warning.
+- Try `Parallel Uploads` = 3 or 4 for many small/medium files.
 
 ### No files appear after selecting a folder
 

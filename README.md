@@ -17,7 +17,7 @@ This project is built with:
 - Upload as Telegram video or as document
 - Custom caption template with placeholders
 - Optional bot token support
-- Fast uploads: TgCrypto encryption plus several files uploading in parallel (messages are still posted in order)
+- Fast uploads: a pool of 4 upload connections shared by all files, 16 parts of each file in flight at once, TgCrypto encryption, and several files uploading in parallel (messages are still posted in order)
 - Live speed (MB/s) and ETA, with per-file status in the list
 - Retry and `FloodWait` handling; stops early on permission errors instead of failing every file
 - Cancel at any time
@@ -185,6 +185,7 @@ The uploader already handles `FloodWait` by sleeping and retrying. If uploads st
 
 - Make sure `TgCrypto-pyrofork` is installed (`pip install -r requirements.txt`). Without it, encryption runs in pure Python at under 1 MB/s and the log shows a warning.
 - Try `Parallel Uploads` = 3 or 4 for many small/medium files.
+- Upload speed for a single file can be tuned with `UPLOAD_CONNECTIONS` and `PARTS_IN_FLIGHT` at the top of `telegram_service.py`.
 
 ### No files appear after selecting a folder
 
@@ -193,13 +194,16 @@ The uploader already handles `FloodWait` by sleeping and retrying. If uploads st
 
 ## Packaging
 
-`PyInstaller` is included in `requirements.txt` if you want to build a Windows executable later.
+The app version lives in `version.py`. To release a new build:
 
-Example:
+1. Bump `__version__` in `version.py` (e.g. `2.0.0` → `2.0.1`)
+2. Run:
 
 ```powershell
-pyinstaller --onefile --windowed main.py
+python build.py
 ```
+
+This creates `dist/AutoUpload-v<version>.exe`. The version is also shown in the window title and in the EXE's file properties (right-click → Properties → Details). Older builds stay in `dist/`, so you can roll back by running a previous one. Settings are shared between versions.
 
 ## Notes
 

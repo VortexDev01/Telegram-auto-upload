@@ -4,16 +4,25 @@ Telegram upload service.
 Handles connecting to Telegram via Pyrogram and uploading video files.
 Several files upload in parallel, but messages are always posted in the
 original order so episodes stay sorted in the chat.
+
+File bytes go through our own uploader instead of Pyrogram's save_file():
+save_file() opens a fresh connection for every file, keeps only 4 parts in
+flight on it, and silently drops parts that fail. Here a small pool of media
+connections is opened once and shared, each file keeps several parts in
+flight spread over all of them, and every part is retried until it lands.
 """
 
 import asyncio
+import math
 import os
 import sys
 import time
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from loguru import logger
 from pyrogram import Client, raw, utils
+from pyrogram.session import Session
 from pyrogram.errors import (
     ChannelPrivate,
     ChatAdminRequired,
@@ -48,17 +57,24 @@ FATAL_SEND_ERRORS = (
 
 PROGRESS_INTERVAL = 0.25  # seconds between progress callbacks per file
 
+# Upload tuning. Throughput on one connection is capped by how much data is
+# in flight, so more connections and more parts in flight = faster uploads.
+UPLOAD_CONNECTIONS = 4        # media connections shared by all files
+PARTS_IN_FLIGHT = 16          # parts of one file being sent at the same time
+PART_SIZE = 512 * 1024        # the largest part Telegram accepts
+BIG_FILE_THRESHOLD = 10 * 1024 * 1024  # larger files use SaveBigFilePart
+PART_TIMEOUT = 60             # seconds; generous so slow links don't time out
+PART_RETRIES = 5
 
+
+@dataclass
 class UploadResult:
     """Stores the outcome of a single file upload."""
-
-    def __init__(self, filename: str, success: bool, error: str = "",
-                 message_id: int | None = None, fatal: bool = False):
-        self.filename = filename
-        self.success = success
-        self.error = error
-        self.message_id = message_id
-        self.fatal = fatal  # the same error would hit every remaining file
+    filename: str
+    success: bool
+    error: str = ""
+    message_id: int | None = None
+    fatal: bool = False  # the same error would hit every remaining file
 
 
 class ChatResolutionError(Exception):
@@ -90,6 +106,7 @@ class TelegramService:
         self._cancel_event: Optional[asyncio.Event] = None
         self._cancel_requested = False
         self._upload_tasks: list[asyncio.Task] = []
+        self._media_sessions: list[Session] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -110,7 +127,6 @@ class TelegramService:
             "api_id": self._api_id,
             "api_hash": self._api_hash,
             "workdir": database.DATA_DIR,
-            "max_concurrent_transmissions": self._parallel,
             "sleep_threshold": 60,
         }
         if self._bot_token:
@@ -137,6 +153,8 @@ class TelegramService:
 
     async def stop(self) -> None:
         """Gracefully disconnect."""
+        sessions, self._media_sessions = self._media_sessions, []
+        await asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
         if self._client and self._client.is_connected:
             await self._client.stop()
             logger.info("Telegram client disconnected.")
@@ -216,6 +234,7 @@ class TelegramService:
 
         resolved_id = await self._resolve_chat_id(chat_id)
         peer = await self._client.resolve_peer(resolved_id)
+        await self._ensure_media_sessions()
 
         semaphore = asyncio.Semaphore(self._parallel)
         # Let uploads run a little ahead of posting, but not so far that
@@ -323,6 +342,24 @@ class TelegramService:
 
         return f"Could not resolve chat_id '{target}': {error}"
 
+    async def _ensure_media_sessions(self) -> None:
+        """Open the shared upload connections (once per service)."""
+        if self._media_sessions:
+            return
+        client = self._client
+        dc_id = await client.storage.dc_id()
+        auth_key = await client.storage.auth_key()
+        test_mode = await client.storage.test_mode()
+        sessions = [
+            Session(client, dc_id, auth_key, test_mode, is_media=True)
+            for _ in range(UPLOAD_CONNECTIONS)
+        ]
+        results = await asyncio.gather(*(s.start() for s in sessions), return_exceptions=True)
+        self._media_sessions = [s for s, r in zip(sessions, results) if not isinstance(r, BaseException)]
+        if not self._media_sessions:
+            raise ConnectionError(f"Could not open upload connections: {results[0]}")
+        logger.info(f"Opened {len(self._media_sessions)} upload connection(s).")
+
     async def _upload_parts(
         self,
         semaphore: asyncio.Semaphore,
@@ -336,44 +373,107 @@ class TelegramService:
         filename = file_info["new_name"]
 
         async with semaphore:
-            if not os.path.isfile(filepath):
+            try:
+                size = os.path.getsize(filepath)
+            except OSError:
                 raise UploadError(f"File not found: {filepath}")
+            if size == 0:
+                raise UploadError("File is empty")
+            limit_mib = 4000 if getattr(self._client.me, "is_premium", False) else 2000
+            if size > limit_mib * 1024 * 1024:
+                raise UploadError(f"File is larger than {limit_mib} MiB, the limit for this account")
 
             if on_file_start:
                 on_file_start(file_info)
 
             last_report = 0.0
 
-            # An async callback avoids Pyrogram's thread-pool hop for every chunk.
-            async def progress(current: int, total: int):
+            def progress(current: int):
                 nonlocal last_report
                 now = time.monotonic()
-                if current < total and now - last_report < PROGRESS_INTERVAL:
+                if current < size and now - last_report < PROGRESS_INTERVAL:
                     return
                 last_report = now
                 if on_progress:
-                    on_progress(file_info, current, total)
+                    on_progress(file_info, current, size)
 
             attempt = 0
             while True:
                 attempt += 1
                 try:
-                    input_file = await self._client.save_file(filepath, progress=progress)
-                    if input_file is None:
-                        raise RuntimeError("upload was interrupted (connection problem)")
-                    return input_file
+                    return await self._save_file(filepath, size, progress)
                 except FloodWait as e:
                     logger.warning(f"FloodWait: sleeping {e.value}s before retrying {filename}")
                     await asyncio.sleep(e.value)
                     attempt -= 1
-                except (ValueError, OSError) as e:
-                    # Empty file, too large, unreadable — retrying won't help.
+                except (FileNotFoundError, PermissionError, IsADirectoryError) as e:
                     raise UploadError(str(e)) from e
                 except Exception as e:
                     logger.error(f"Upload attempt {attempt}/{max_retries} failed for {filename}: {e}")
                     if attempt >= max_retries:
                         raise UploadError(str(e)) from e
                     await asyncio.sleep(3 * attempt)
+
+    async def _save_file(self, filepath: str, size: int, progress: Callable[[int], None]):
+        """Send every part of *filepath*, several at once over the shared connections."""
+        total_parts = math.ceil(size / PART_SIZE)
+        is_big = size > BIG_FILE_THRESHOLD
+        file_id = self._client.rnd_id()
+        pending = iter(range(total_parts))  # shared by the workers below
+        done = 0
+
+        async def worker(n: int):
+            nonlocal done
+            session = self._media_sessions[n % len(self._media_sessions)]
+            with open(filepath, "rb") as fp:
+                for part in pending:
+                    sent = await self._send_part(session, fp, file_id, part, total_parts, is_big)
+                    done += sent  # not "done += await ...", which would read done before awaiting
+                    progress(done)
+
+        workers = [asyncio.create_task(worker(n)) for n in range(min(PARTS_IN_FLIGHT, total_parts))]
+        try:
+            finished, _ = await asyncio.wait(workers, return_when=asyncio.FIRST_EXCEPTION)
+            for task in finished:
+                if task.exception():
+                    raise task.exception()
+        finally:
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+        name = os.path.basename(filepath)
+        if is_big:
+            return raw.types.InputFileBig(id=file_id, parts=total_parts, name=name)
+        # The MD5 checksum is optional; skipping it lets small files upload in parallel too.
+        return raw.types.InputFile(id=file_id, parts=total_parts, name=name, md5_checksum="")
+
+    async def _send_part(self, session: Session, fp, file_id: int, part: int,
+                         total_parts: int, is_big: bool) -> int:
+        """Read one part (off the event loop) and save it, retrying until it lands."""
+        chunk = await asyncio.to_thread(_read_part, fp, part)
+        if is_big:
+            rpc = raw.functions.upload.SaveBigFilePart(
+                file_id=file_id, file_part=part, file_total_parts=total_parts, bytes=chunk,
+            )
+        else:
+            rpc = raw.functions.upload.SaveFilePart(file_id=file_id, file_part=part, bytes=chunk)
+
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                if not await session.invoke(rpc, timeout=PART_TIMEOUT):
+                    raise RuntimeError(f"Telegram rejected part {part}")
+                return len(chunk)
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+                attempt -= 1
+            except Exception as e:
+                if attempt >= PART_RETRIES:
+                    raise
+                logger.debug(f"Retrying part {part} ({attempt}/{PART_RETRIES}): {e}")
+                await asyncio.sleep(attempt)
 
     async def _send_with_retry(
         self,
@@ -433,7 +533,10 @@ class TelegramService:
                 ))
             except FilePartMissing as e:
                 # Telegram lost a part; re-upload only that chunk.
-                await client.save_file(filepath, file_id=input_file.id, file_part=e.value)
+                is_big = isinstance(input_file, raw.types.InputFileBig)
+                with open(filepath, "rb") as fp:
+                    await self._send_part(self._media_sessions[0], fp, input_file.id,
+                                          e.value, input_file.parts, is_big)
                 continue
 
             for update in getattr(r, "updates", []):
@@ -442,3 +545,8 @@ class TelegramService:
             return None
 
         raise RuntimeError("Telegram kept reporting missing file parts")
+
+
+def _read_part(fp, part: int) -> bytes:
+    fp.seek(part * PART_SIZE)
+    return fp.read(PART_SIZE)

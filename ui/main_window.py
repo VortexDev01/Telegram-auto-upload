@@ -19,6 +19,7 @@ import config_manager
 import database
 import file_manager
 import rename_manager
+from version import __version__
 from telegram_service import TelegramService
 from ui.settings_window import SettingsWindow
 
@@ -60,7 +61,7 @@ class MainWindow(ctk.CTk):
         super().__init__()
 
         # ---- Window setup -------------------------------------------------
-        self.title("📤  Telegram Auto Uploader")
+        self.title(f"📤  Telegram Auto Uploader  v{__version__}")
         self.geometry("960x800")
         self.minsize(820, 600)
         ctk.set_appearance_mode("dark")
@@ -108,7 +109,7 @@ class MainWindow(ctk.CTk):
         self._log_sink_id = logger.add(
             self._log_sink, format="{time:HH:mm:ss} | {level.icon} | {message}", level="DEBUG",
         )
-        logger.info(f"Application started. Settings are stored in {database.DATA_DIR}")
+        logger.info(f"Application v{__version__} started. Settings are stored in {database.DATA_DIR}")
         if config_manager.validate_config(self._config):
             logger.info("Go to Settings to configure credentials.")
 
@@ -328,7 +329,7 @@ class MainWindow(ctk.CTk):
 
     def _build_footer(self):
         ft = ctk.CTkLabel(
-            self, text="Telegram Auto Uploader  •  Built with Pyrogram MTProto & CustomTkinter",
+            self, text=f"Telegram Auto Uploader v{__version__}  •  Built with Pyrogram MTProto & CustomTkinter",
             font=ctk.CTkFont(size=11), text_color="#4a4a6a",
         )
         ft.pack(side="bottom", pady=(0, 10))
@@ -613,7 +614,8 @@ class MainWindow(ctk.CTk):
 
         except Exception as e:
             logger.error(f"Upload error: {e}")
-            self._post(lambda: self.progress_label.configure(text=f"❌ {e}"[:120]))
+            text = f"❌ {e}"[:120]  # bind now: "e" is deleted when the except block ends
+            self._post(lambda: self.progress_label.configure(text=text))
         finally:
             await self._tg_service.stop()
 

@@ -19,7 +19,12 @@ from typing import Any
 
 from loguru import logger
 
+import secret_store
+
 APP_NAME = "AutoUpload"
+
+# Settings that are encrypted at rest (see secret_store).
+SECRET_KEYS = {"api_hash", "telegram_bot_token"}
 
 
 def _get_data_dir() -> str:
@@ -84,11 +89,25 @@ def get_all_settings() -> dict:
         rows = conn.execute("SELECT key, value FROM settings").fetchall()
     result = {}
     for row in rows:
+        key = row["key"]
         try:
-            result[row["key"]] = json.loads(row["value"])
+            value = json.loads(row["value"])
         except json.JSONDecodeError:
-            result[row["key"]] = row["value"]
+            value = row["value"]
+        if key in SECRET_KEYS:
+            try:
+                value = secret_store.decrypt(value)
+            except OSError as e:
+                logger.warning(f"Could not decrypt saved {key} (saved by another Windows user?): {e}")
+                continue
+        result[key] = value
     return result
+
+
+def _encode_setting(key: str, value: Any) -> str:
+    if key in SECRET_KEYS and isinstance(value, str):
+        value = secret_store.encrypt(value)
+    return json.dumps(value, ensure_ascii=False)
 
 
 def set_settings(values: dict[str, Any]) -> None:
@@ -98,7 +117,7 @@ def set_settings(values: dict[str, Any]) -> None:
         conn.executemany(
             "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            [(k, json.dumps(v, ensure_ascii=False), now) for k, v in values.items()],
+            [(k, _encode_setting(k, v), now) for k, v in values.items()],
         )
 
 
@@ -179,7 +198,7 @@ def _migrate_legacy_files(conn: sqlite3.Connection) -> None:
                 with conn:
                     conn.executemany(
                         "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
-                        [(k, json.dumps(v, ensure_ascii=False), now) for k, v in data.items()],
+                        [(k, _encode_setting(k, v), now) for k, v in data.items()],
                     )
                 has_settings = True
                 logger.info(f"Imported settings from {legacy_config}")

@@ -10,8 +10,7 @@ TgCrypto-pyrofork==1.2.8
 # Natural file sorting (important for correct episode order)
 natsort==8.4.0
 
-# Optional utilities (recommended)
-python-dotenv==1.0.1
+# Logging
 loguru==0.7.2
 
 # Build tool (only needed for packaging to EXE)

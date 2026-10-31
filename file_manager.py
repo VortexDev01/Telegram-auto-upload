@@ -36,19 +36,6 @@ def get_sorted_videos(folder: str) -> list[str]:
     return sorted_files
 
 
-def get_file_info(filepath: str) -> dict:
-    """Return basic metadata about a single file."""
-    stat = os.stat(filepath)
-    size_mb = stat.st_size / (1024 * 1024)
-    return {
-        "path": filepath,
-        "name": os.path.basename(filepath),
-        "size": stat.st_size,
-        "size_mb": round(size_mb, 2),
-        "extension": os.path.splitext(filepath)[1].lower(),
-    }
-
-
 # Telegram limits: 2000 MiB normally, 4000 MiB for Premium user accounts.
 MAX_UPLOAD_BYTES = 2000 * 1024 * 1024
 MAX_PREMIUM_UPLOAD_BYTES = 4000 * 1024 * 1024
